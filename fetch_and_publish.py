@@ -1,7 +1,36 @@
 #!/usr/bin/env python3
-import os, sys, csv, ftplib, io, xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+# -*- coding: utf-8 -*-
 
+"""
+Primevo / BigBuy → Public Feed (HTTPS)
+- Downloadt geselecteerde BigBuy XML's (uit products_list.txt) via FTP
+- Parse + filtert server-side (voor Sheets)
+- Publiceert naar /public:
+    catalog_preview.csv  (volledige velden + image_preview formule)
+    catalog_light.csv    (lichte versie voor Google Sheets)
+    feed.xml             (eenvoudige XML)
+    last_run.txt, _ping.txt
+
+Secrets (GitHub Actions → Repository secrets):
+  BB_HOST=www.dropshippers.com.es
+  BB_USER=...
+  BB_PASS=...
+
+Optionele regelbestanden (repo root; 1 item per regel):
+  allow_categories.txt   # BigBuy category ID’s om toe te laten (bv. 2662)
+  deny_keywords.txt      # te blokkeren keywords (case-insensitive)
+  allow_brands.txt       # whitelabel brands (id/naam); leeg = alles
+"""
+
+import os
+import sys
+import io
+import csv
+import ftplib
+import xml.etree.ElementTree as ET
+from datetime import datetime
+
+# --------- ENV / PAD ---------
 HOST = os.environ.get("BB_HOST")
 USER = os.environ.get("BB_USER")
 PASS = os.environ.get("BB_PASS")
@@ -10,72 +39,109 @@ INPUT_LIST = "products_list.txt"
 OUT_DIR = "public"
 os.makedirs(OUT_DIR, exist_ok=True)
 
-# نضيف حقول مفيدة للفلترة + الإخراج
+# --------- VELDEN UIT XML ---------
 FIELDS = [
-    "id","name","description","price","pvd","ean13","stock","image1",
-    "category","brand","date_upd","width","height","depth","weight"
+    "id", "name", "description", "price", "pvd", "ean13", "stock", "image1",
+    "category", "brand", "date_upd", "width", "height", "depth", "weight"
 ]
 
-BAD_WORDS = {"adult","sex","erot","porno","condom","dildo","vibrator","bdsm"}
-MIN_PRICE = 10.0
-MAX_PRICE = 80.0
-MAX_WEIGHT = 8.0     # كغ، تجاهل لو غير متوفر
-MAX_PRODUCTS = 5000  # سقف نهائي للعدد
-RECENT_MONTHS = 18   # تجاهل لو ما في date_upd
+# --------- FILTER INSTELLINGEN ---------
+MIN_PRICE     = 10.0
+MAX_PRICE     = 80.0
+MIN_STOCK     = 1
+MAX_WEIGHT    = 8.0          # kg; genegeerd als leeg
+RECENT_MONTHS = 18           # genegeerd als date_upd ontbreekt
+MAX_PRODUCTS  = 5000         # harde cap na sorteren
 
-def parse_float(x, default=0.0):
+# --------- REGELBESTANDEN (optioneel) ---------
+def _load_list(path: str):
+    if not os.path.exists(path):
+        return []
+    with open(path, "r", encoding="utf-8") as f:
+        return [ln.strip() for ln in f if ln.strip() and not ln.strip().startswith("#")]
+
+ALLOW_CATS   = set(_load_list("allow_categories.txt"))           # bv. {"2662","2609"}
+DENY_WORDS   = set(w.lower() for w in _load_list("deny_keywords.txt"))
+ALLOW_BRANDS = set(_load_list("allow_brands.txt"))
+
+# --------- HELPERS ---------
+def _pfloat(x, default=0.0):
     try:
-        return float(x.replace(",", "."))
-    except:
+        return float(str(x).replace(",", "."))
+    except Exception:
         return default
 
-def parse_int(x, default=0):
+def _pint(x, default=0):
     try:
         return int(float(x))
-    except:
+    except Exception:
         return default
 
-def is_recent(iso):
-    # "YYYY-MM-DD HH:MM:SS"
+def _is_recent(iso: str) -> bool:
+    if not iso:
+        return True
     try:
         dt = datetime.strptime(iso.strip(), "%Y-%m-%d %H:%M:%S")
-        age_days = (datetime.now() - dt).days
-        return age_days <= RECENT_MONTHS * 30
-    except:
-        return True  # لو ما قدرنا نقرأها ما نرفض بسببها
+        return (datetime.now() - dt).days <= RECENT_MONTHS * 30
+    except Exception:
+        return True
 
-def keep_row(r):
-    # شروط أساسية
-    stock = parse_int(r.get("stock","0"))
-    if stock <= 0: return False
+def _has_allowed_category(cat_field: str) -> bool:
+    if not ALLOW_CATS:
+        return True
+    parts = [c.strip() for c in (cat_field or "").split(",") if c.strip()]
+    return any(p in ALLOW_CATS for p in parts)
 
-    price = parse_float(r.get("price","0"))
-    if not (MIN_PRICE <= price <= MAX_PRICE): return False
+def _has_bad_word(name: str, desc: str) -> bool:
+    if not DENY_WORDS:
+        return False
+    t = f"{name or ''} {desc or ''}".lower()
+    return any(bad in t for bad in DENY_WORDS)
 
-    if not r.get("ean13"): return False
-    if not r.get("image1"): return False
+def _keep_row(r: dict) -> bool:
+    # categorie-filter
+    if not _has_allowed_category(r.get("category", "")):
+        return False
 
-    # فلترة كلمات مزعجة
-    text = (r.get("name","") + " " + r.get("description","")).lower()
-    if any(bad in text for bad in BAD_WORDS): return False
+    # basisfilters
+    if _pint(r.get("stock")) < MIN_STOCK:
+        return False
 
-    # أوزان/أبعاد لو متوفرة
-    w_kg = parse_float(r.get("weight","0"))
-    if w_kg and w_kg > MAX_WEIGHT: return False
+    price = _pfloat(r.get("price"))
+    if not (MIN_PRICE <= price <= MAX_PRICE):
+        return False
 
-    # حداثة التحديث (اختياري)
-    du = r.get("date_upd","").strip()
-    if du and not is_recent(du): return False
+    if not r.get("ean13"):
+        return False
+    if not r.get("image1"):
+        return False
+
+    # gewicht (optioneel)
+    w = _pfloat(r.get("weight"))
+    if w and w > MAX_WEIGHT:
+        return False
+
+    # actualiteit (optioneel)
+    if r.get("date_upd") and not _is_recent(r.get("date_upd")):
+        return False
+
+    # brand whitelist (optioneel)
+    if ALLOW_BRANDS and (r.get("brand", "") not in ALLOW_BRANDS):
+        return False
+
+    # keywords blokkeren
+    if _has_bad_word(r.get("name", ""), r.get("description", "")):
+        return False
 
     return True
 
-def fetch_file(ftp, name):
-    path = f"/files/products/xml/standard/{name}"
-    bio = io.BytesIO()
-    ftp.retrbinary(f"RETR {path}", bio.write)
-    return bio.getvalue()
+def _ftp_fetch(ftp: ftplib.FTP, filename: str) -> bytes:
+    path = f"/files/products/xml/standard/{filename}"
+    buf = io.BytesIO()
+    ftp.retrbinary(f"RETR {path}", buf.write)
+    return buf.getvalue()
 
-def parse_xml(xml_bytes):
+def _parse_xml(xml_bytes: bytes):
     out = []
     root = ET.fromstring(xml_bytes)
     for p in root.findall(".//product"):
@@ -86,66 +152,84 @@ def parse_xml(xml_bytes):
         out.append(row)
     return out
 
+# --------- MAIN ---------
 def main():
+    with open(INPUT_LIST, "r", encoding="utf-8") as f:
+        file_names = [ln.strip() for ln in f if ln.strip() and not ln.strip().startswith("#")]
+
     all_rows = []
     files_done = 0
-
-    with open(INPUT_LIST, "r", encoding="utf-8") as f:
-        names = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
 
     with ftplib.FTP(HOST, timeout=60) as ftp:
         ftp.set_pasv(True)
         ftp.login(USER, PASS)
-        for name in names:
+
+        for name in file_names:
             try:
-                data = fetch_file(ftp, name)
-                rows = parse_xml(data)
+                raw = _ftp_fetch(ftp, name)
+                rows = _parse_xml(raw)
                 files_done += 1
-                # فلترة
-                for r in rows:
-                    if keep_row(r):
-                        all_rows.append(r)
-                print(f"[ok] {name}: {len(rows)} rows → kept {sum(1 for _ in rows if keep_row(_))}")
+
+                kept = [r for r in rows if _keep_row(r)]
+                all_rows.extend(kept)
+                print(f"[ok] {name}: {len(rows)} → kept {len(kept)}")
+
             except Exception as e:
                 print(f"[warn] {name}: {e}", file=sys.stderr)
 
-    # ترتيب حسب المخزون نزولاً ثم السعر صعوداً
-    all_rows.sort(key=lambda r: (-parse_int(r.get("stock","0")), parse_float(r.get("price","0"))))
-    # سقف العدد
+    # sorteer: hoogste stock eerst, dan laagste prijs
+    all_rows.sort(key=lambda r: (-_pint(r.get("stock")), _pfloat(r.get("price"))))
     if MAX_PRODUCTS and len(all_rows) > MAX_PRODUCTS:
         all_rows = all_rows[:MAX_PRODUCTS]
 
-    # CSV
-    csv_path = os.path.join(OUT_DIR,"catalog_preview.csv")
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["Keep?"]+FIELDS+["image_preview"])
+    # ---- CSV: preview (vol) ----
+    csv_preview = os.path.join(OUT_DIR, "catalog_preview.csv")
+    with open(csv_preview, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["Keep?"] + FIELDS + ["image_preview"])
         w.writeheader()
         for r in all_rows:
-            r2 = {"Keep?": ""}
-            r2.update(r)
-            r2["image_preview"] = f'=IMAGE("{r.get("image1","")}")' if r.get("image1") else ""
-            w.writerow(r2)
+            row = {"Keep?": ""}
+            row.update(r)
+            row["image_preview"] = f'=IMAGE("{r.get("image1","")}")' if r.get("image1") else ""
+            w.writerow(row)
 
-    # XML مصغّر
-    xml_path = os.path.join(OUT_DIR,"feed.xml")
-    def esc(t): 
-        return (t or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+    # ---- CSV: light (sneller voor Sheets) ----
+    light_fields = ["id", "name", "price", "pvd", "ean13", "stock", "image1"]
+    csv_light = os.path.join(OUT_DIR, "catalog_light.csv")
+    with open(csv_light, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["Keep?"] + light_fields)
+        w.writeheader()
+        for r in all_rows:
+            row = {"Keep?": ""}
+            for k in light_fields:
+                row[k] = r.get(k, "")
+            w.writerow(row)
+
+    # ---- XML eenvoudig ----
+    def esc(t: str) -> str:
+        return (t or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    xml_path = os.path.join(OUT_DIR, "feed.xml")
     with open(xml_path, "w", encoding="utf-8") as f:
         f.write('<?xml version="1.0" encoding="UTF-8"?>\n<catalog>')
         for r in all_rows:
             f.write("<product>")
             for k in FIELDS:
-                if k in {"name","description"}:
+                if k in {"name", "description"}:
                     f.write(f"<{k}><![CDATA[{r.get(k,'')}]]></{k}>")
                 else:
                     f.write(f"<{k}>{esc(r.get(k))}</{k}>")
             f.write("</product>")
         f.write("</catalog>")
 
-    # لمحة و Ping
-    open(os.path.join(OUT_DIR,"last_run.txt"),"w").write(datetime.now(timezone.utc).isoformat())
-    open(os.path.join(OUT_DIR,"_ping.txt"),"w").write("ok")
+    # markers
+    open(os.path.join(OUT_DIR, "last_run.txt"), "w", encoding="utf-8").write(datetime.utcnow().isoformat())
+    open(os.path.join(OUT_DIR, "_ping.txt"), "w", encoding="utf-8").write("ok")
 
     print(f"Done. files={files_done}, kept={len(all_rows)}")
+    print(f"Preview CSV: {csv_preview}")
+    print(f"Light   CSV: {csv_light}")
+    print(f"XML        : {xml_path}")
+
 if __name__ == "__main__":
     main()
