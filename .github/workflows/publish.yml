@@ -2,28 +2,48 @@ name: Publish BigBuy Feed
 
 on:
   schedule:
-    - cron: "0 */3 * * *"
-  workflow_dispatch:
+    - cron: "0 */3 * * *"   # elke 3 uur
+  workflow_dispatch:        # handmatig starten
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
       - name: Build feed
         env:
+          # --- BigBuy FTP secrets ---
           BB_HOST: ${{ secrets.BB_HOST }}
           BB_USER: ${{ secrets.BB_USER }}
           BB_PASS: ${{ secrets.BB_PASS }}
+
+          # --- Prijs- en filterinstellingen ---
+          AVP_SOURCE: price        # of: pvp_bigbuy
+          SHIP_COST_EUR: "0"
+          VAT_PCT: "21"
+          BOL_FEE_PCT: "12"
+          BOL_FEE_FIXED: "0.3"
+          MIN_PROFIT_EUR: "3"
+          MIN_MARGIN_PCT: "15"
+          MIN_PRICE: "10"
+          MAX_PRICE: "80"
+          MIN_STOCK: "1"
+          MAX_WEIGHT: "8"
+          MAX_PRODUCTS: "5000"
+          RECENT_MONTHS: "18"
         run: |
           python fetch_and_publish.py
+
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
           path: public
+
   deploy:
     needs: build
     permissions:
